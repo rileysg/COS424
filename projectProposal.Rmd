@@ -46,6 +46,7 @@ require(dplyr)
 require(ggplot2)
 require(nnet)
 require( caret)
+require( KernSmooth)
 
 #loading the data and putting it in tidy format
 load.neuro1 <- read.csv("worm1_neuro.csv") %>%
@@ -159,8 +160,8 @@ ggsave("worm1Traces.eps", width= 10* 1.6, height= 10)
 ```
 
 ## Model Validation
-
-Generalization error between on a testing dataset is one approach to validate a model.
++++++THIS SECTION TENTATIVE++++++
+Generalization error on a testing dataset is one approach to validate a model.
 In partitioning the data, we wanted to maintain as much temporal structure as possible.
 Therefore, we split the data into segments each containing 9 timepoints and randomly assigned 20% of these values to the testing set.
 
@@ -179,7 +180,6 @@ neuro.grouped <- neuro %>%
   group_by( segment) %>%
   mutate( all.forward= cumall( as.character(behavior) == "forward"),
           segment.time= Time.s. - first(Time.s.))
-
 
 #set the proportion of samples to be used in the training set
 train.proportion= 0.8
@@ -252,7 +252,7 @@ labs( x= "signal", y="Neuron ID", title= "Behaviors are associated with differen
 
 <!-- ## Logistic Regression -->
 
-<!-- The marginal distributions of activity for each neuron look roughly linear for each neuron. -->
+<!-- The marginal distributions of activity for each neuron look roughly gausian for each neuron. -->
 <!-- What is the correlation structure? -->
 
 <!-- ```{r Logistic Model} -->
@@ -290,9 +290,9 @@ labs( x= "signal", y="Neuron ID", title= "Behaviors are associated with differen
 
 ## Hidden Markov Model
 
-A generative model that can potentially be simple to estimate is the hidden markov model.
+An easy to estimate generative model is the hidden markov model.
 Let the activity of each neuron be multivariate normal and let the staes of the model be forward, backward, turn, and pause. Following the approach of MLAPP, the transition matrix and multinomial distribution of initial states can be estimated using the observed proportions in the dataset.
-The sampling distribution of the mean will be 
+The sampling distribution of the mean will be XXXX.
 The sampling distribution of the covariance matrix will have a Wischart distribution.
 Covariance matrices are highly sensitive to outliers, so identifying and removing outliers may be an important part of the estimation process.
 
@@ -300,6 +300,28 @@ One question that seems reasonable to ask is whether including the full covarian
 This is equivalent to testing a model with an unconstrained covariance matrix against a model with a diagonal covariance matrix.
 
 ```{r gausianHMM, fig.width=8, fig.height=8, cache= TRUE}
+
+getTransitionMat <- function( Y, groupOrder) {
+  #drop any unobserved states
+  states <- unique( as.factor( Y))
+  
+  #get the number of transitions between states
+  #initalize an empty transition matrix with rows and cols corresponding to states
+  A <- matrix(data= c(0), nrow= length( states), ncol= length( states),
+              dimnames= list( from= as.character( states), to= as.character( states)))
+  #iterate over a vector of all but the last observation
+  iis <- length( Y) - 1
+  for( ii in  1:iis){
+    #if Y[ii] and Y[ii + 1] are in the same group
+    #otherwise they are in different groups, so this pair doesn't inform the transition matrix
+    if( groupOrder[ ii + 1] > groupOrder[ ii]){
+      fromInd <- which( states == as.character( Y[ii]))
+      toInd <- which( states == as.character( Y[ii + 1]))
+      A[ fromInd, toInd] <- A[ fromInd, toInd] + 1
+    }
+  }
+  A <- A / rowSums(A)
+}
 
 #' Title
 #'
@@ -329,33 +351,29 @@ train.hmm.fullCov <- function(Y, X, groupOrder){
   #this is used for starting probabilities
   piZero <- table( Y) / length( Y)
   
-  #get the number of transitions between states
-  #initalize an empty transition matrix with rows and cols corresponding to states
-  A <- matrix(data= c(0), nrow= length( states), ncol= length( states),
-              dimnames= list( from= as.character( states), to= as.character( states)))
-  #iterate over a vector of all but the last observation
-  iis <- length( Y) - 1
-  for( ii in  1:iis){
-    #if Y[ii] and Y[ii + 1] are in the same group
-    #otherwise they are in different groups, so this pair doesn't inform the transition matrix
-    if( groupOrder[ ii + 1] > groupOrder[ ii]){
-      fromInd <- which( states == as.character( Y[ii]))
-      toInd <- which( states == as.character( Y[ii + 1]))
-      A[ fromInd, toInd] <- A[ fromInd, toInd] + 1
-    }
-  }
-  A <- A / rowSums(A)
+  #emperical probability of transition between states
+  A <- getTransitionMat( Y, groupOrder)
   
   #return a list representation of the HMM
   list( A= A, piZero= piZero, theta= theta)
 }
 
+#TODO test viterbi.hmm.gausian for correctness using some simple toy examples
 
-#code for testing viterbi.hmm.gausian
-X <- filter( worm1.wide, segment == 3) %>% ungroup() %>% select( num_range( "Neuron.", 1:distinct.neuron.vec[ myWorm])) %>% as_data_frame()
-filter( worm1.wide, segment == 3)
-model <-worm1.hmm.fullCov
-
+#' Use viterbi decoding to predict hidden states from observed emissions. Works for models
+#'
+#' @param X : A matrix with each row representing an emission
+#' @param model : A model of the format generated by train.hmm.fullCov. note, that the order of variables in X must correspond to the order of variables in the parameters of "model".
+#'
+#' @return A vector of strings representing each of the states
+#' @export
+#'
+#' @examples
+#lpGausianEmission is a simple function used in viterbi.hmm.gausian
+#proportional to the gausian emission liklihood
+lpGaussianEmission <- function( x, lambda, eta){
+  t(eta) %*% x - 0.5* t(x) %*% lambda %*% x
+}
 viterbi.hmm.gausian <- function( X, model){
   states <- names(model[["theta"]])
 
@@ -405,22 +423,17 @@ viterbi.hmm.gausian <- function( X, model){
   for( ii in ( length( xstar)):2){
     xstar[ ii -1] <- as[ xstar[ii], ii]
   }
+  
+  # return states using the labels from model
+  states[xstar]
 }
 
-x <- t( X[1,])
-lambda <- lambdas[["forward"]]
-eta <-  etas[["forward"]]
-#proportional to the gausian emission liklihood
-lpGaussianEmission <- function( x, lambda, eta){
-  t(eta) %*% x - 0.5* t(x) %*% lambda %*% x
-}
+
 #Change data to wide format
 train.wide <- train %>% group_by( segment, worm) %>%
   spread( neuron, signal)
 
-#split the data for worm1 into X Y format
-#TODO: fix this... correlations for pausing behavior shouldn't be present for worm1
-
+#change data format to fit a model for a single worm
 worm1.wide <- train.wide %>% filter( worm == "worm1")
 Y <- worm1.wide$behavior
 groupOrder <- worm1.wide$index
@@ -431,9 +444,18 @@ X <- worm1.wide %>%
 #train the HMM
 worm1.hmm.fullCov <- train.hmm.fullCov( Y, X, groupOrder)
 
-#extract fitted variables to visualize them
-thetas <- worm1.hmm.fullCov[["theta"]]
+#testing viterbi.hmm.gausian using 9 consecutive observations
+X.test <- filter( worm1.wide, segment == 3) %>%
+  ungroup() %>%
+  select( num_range( "Neuron.", 1:distinct.neuron.vec[ myWorm])) %>%
+  as_data_frame()
+#calculate most probable sequence of states and compare to true values
+data.frame( predicted= viterbi.hmm.gausian( X.test, worm1.hmm.fullCov),
+            true= filter( worm1.wide, segment == 3) %>% ungroup() %>% select( true= behavior))
 
+
+#extract fitted variables from the HMM to visualize them
+thetas <- worm1.hmm.fullCov[["theta"]]
 #
 hist( thetas[["reverse"]][["cov"]])
 #color scale
@@ -448,7 +470,74 @@ heatmap(  1-cov2cor( thetas[["forward"]][["cov"]]), symm= TRUE, col = terrain.co
 #XXX this shouldn't be the case if worm1 doesn't ever pause
 #heatmap(  1-cov2cor( worm.covs[[1]][[4]]), symm= TRUE, col = terrain.colors(16))
 ```
+
+If the neurons can be assumed to be independent, a kernel density estimate can be used to provide an estimate of the emision probabilities that does not depend on the assumption of independence.
+
+```{r kdeGMM}
+gmmKde <- function( Y, X, groupOrder){
+  #remove any non-observed states from the factor datatype
+  states <- unique( as.factor( Y))
   
+  theta <- lapply( states, function( myState){
+    #compute bandwith estimates for KDE
+    bandwidths <- apply( X= X, MARGIN= 2, FUN= dpik)
+    
+    #store previous observations as parameters of the model
+    list( observations= X[ Y == myState, ],
+          bandwidths= bandwidths)
+    })
+  names( theta) <- as.character( states)
+  
+  #get the overal proportion of each state
+  #this is used for starting probabilities
+  piZero <- table( Y) / length( Y)
+  
+  #emperical probability of transition between states
+  A <- getTransitionMat( Y, groupOrder)
+  
+  #return a list representation of the HMM
+  list( A= A, piZero= piZero, theta= theta)
+}
+
+gmmKde.predict <- function( X,groupOrder){
+  #TODO: use veterbi algorithm to make predictions from kernel density estimates
+}
+
+#for testing gmmKde
+myState <- "forward"
+myWorm <- "worm1"
+worm1.wide <- train.wide %>% filter( worm == "worm1")
+X <- worm1.wide %>% 
+  as.data.frame() %>%
+  select( num_range( "Neuron.", 1:distinct.neuron.vec[ myWorm]))
+#find observations without any missing values
+non.nan <- which( !is.na(rowSums( X)))
+X <- X[ non.nan, ]
+Y <- worm1.wide$behavior[ non.nan]
+groupOrder <- worm1.wide$index[ non.nan]
+```
+
+```{r crossValidation}
+
+foldCV <- function( training, test)
+#partition the training data into training and hold out sets
+
+```
+
+Given a single model, it is important to diagnose potential problems.
+After fitting several models, comparisons should be made using methods for evaluating multilcass classification performance.
+[Here](http://www.r-bloggers.com/error-metrics-for-multi-class-problems-in-r-beyond-accuracy-and-kappa/) is a website with some R packages that do multiclass classification metrics.
+* Multiclass methods
+    + Confusion matrix
+    + Hinge loss
+    + Hamming loss
+    + Classification accuracy (Jaccard similarity)
+    + Precision and recall
+    + Log-loss requires predictions in the form of class probabilities
+* Binary method apply to multiclass setting by considering a binary classification for each class.
+    + ROC: easy to visualize
+    + AUC ROC: easy to summarize
+
 ## Conditional Random Field
 * Conditional Random Fields
   + Attributes: Descriminative

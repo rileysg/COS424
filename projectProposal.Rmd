@@ -1,0 +1,454 @@
+---
+title: "Worm behavior"
+author: "Riley Skeen-Gaar"
+date: "April 19, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE, cache=TRUE, autodep=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Goal of the project
+predicting behavior at a particular moment using a set of measured nerve impulses over time
+
+## Description of the dataset
+
+## Models
+* Gausian Process
+    + individual model for each worm
+
+* Representation using Latent States
+
+* Graphical model structure learning
+    + infering covariance structures
+  
+* Hidden Markov model
+
+
+
+## Questions we want to answer
+* What temporal resolution is needed to resolve worm behaviors?
+* What has been done in this field previously?
+* How can information about one worm inform behavior predictions for another worm?
+
+## Data analysis
+
+First, the data was loaded and represented in the following format. Each observation corresponds to a row. Collumns represent the following:
+* "time.s." time of an observation following the begining of the recording.
+* "x.mm" and "y.mm" represent the position of the center of mass of the worm in mm.
+* "behavior" is a catagorical variable representing the type of locomotion that the worm is engaged. These catagories are based on "eigenworm" analysis.
+* "worm" is a catagorical random variable that identifies which individual is being observed in the experiment.
+
+```{r load, echo= FALSE}
+require(tidyr)
+require(dplyr)
+require(ggplot2)
+require(nnet)
+require( caret)
+
+#loading the data and putting it in tidy format
+load.neuro1 <- read.csv("worm1_neuro.csv") %>%
+  gather( neuron, signal, -(Time.s.:behavior)) %>%
+  mutate( worm = as.factor("worm1"))
+load.neuro2 <- read.csv("worm2_neuro.csv") %>%
+  gather( neuron, signal, -(Time.s.:behavior)) %>%
+  mutate( worm = "worm2")
+load.neuro3 <- read.csv("worm3_neuro.csv") %>%
+  gather( neuron, signal, -(Time.s.:behavior)) %>%
+  mutate( worm = "worm3")
+load.neuro4 <- read.csv("worm4_neuro.csv") %>%
+  gather( neuron, signal, -(Time.s.:behavior)) %>%
+  mutate( worm = "worm4")
+load.neurogfp <- read.csv("wormgfp_neuro.csv")
+colnames( load.neurogfp) <- gsub( "Neuron", "Neuron.", colnames(load.neurogfp))
+load.neurogfp <- load.neurogfp %>%
+  gather( neuron, signal, -(Time:behavior)) %>%  #XXX the neuron labels are not consistent with the other files
+  mutate( worm = "wormgfp") %>% #label for loaded data
+  rename( Time.s. = Time) #rename time collumn for consistency
+
+#combine the data into a single dataframe
+neuro <- bind_rows(load.neuro1, load.neuro2, load.neuro3, load.neuro4, load.neurogfp)
+rm( list= ls( pattern = "load")) #clean up the work environment
+# change from character datatypes to factors 
+neuro$worm <- as.factor( neuro$worm) 
+neuro$neuron <- as.factor( neuro$neuron) 
+neuro$behavior <- as.factor( neuro$behavior)
+levels(neuro$behavior) <- c("reverse", "pause", "forward", "turn") #make levels of behavior interpretable
+
+# record number of neurons for each animal
+distinct.neurons <- group_by( neuro, worm) %>% 
+  summarise( total.neurons= n_distinct(neuron))
+distinct.neuron.vec <- distinct.neurons$total.neurons
+names( distinct.neuron.vec) <- as.character( distinct.neurons$worm)
+
+head( neuro)
+```
+
+Next the catagorical variables were analysed,
+```{r catagorical, cache=TRUE}
+#do the neuron IDs correspond between worms? 
+#No, based on the paper, the neurons should not correspond
+
+#what proportion of the signal values are missing?
+missing.values <- neuro %>%
+  group_by( worm) %>%
+  summarize( NaN.observations = sum( is.na( signal)),
+             nonNaN.observations= n(),
+             percentage.NaN= 100*NaN.observations/ (NaN.observations + nonNaN.observations))
+
+#what percentage of observations consist of each type of behavior?
+behave.count <- neuro %>%
+  filter( neuron %in% c("Neuron.1")) %>%
+  group_by( worm) %>%
+  summarize( timepoints= n(),
+             percentage.forward= 100* sum( behavior %in% c( "forward")) / timepoints,
+             percentage.turn= 100* sum( behavior %in% c( "turn")) / timepoints,
+             percentage.pause= 100* sum( behavior %in% c( "pause")) / timepoints,
+             percentage.reverse= 100* sum( behavior %in% c( "reverse")) / timepoints)
+
+#change default dplyr width
+options( dplyr.width = 300)
+#display information on the dataset
+bind_cols( distinct.neurons, missing.values[, 2:4], behave.count[, 2:6])
+
+#Plot the behaviour proportions
+ggplot( neuro %>% filter( neuron %in% c("Neuron.1")), mapping= aes(x= worm, fill=  behavior)) +
+  geom_bar( position = "dodge")
+#note that some types of behavior are not observed for some worms
+```
+
+The values of neuron activity were also analysed
+```{r continuous, cache=TRUE}
+#neuron summary statistics
+
+neuron.summary <- group_by( neuro, worm, neuron ) %>%
+  filter( worm != "wormgfp") %>%
+  summarise( mean= mean(signal, na.rm= TRUE),
+             var= var(signal, na.rm= TRUE),
+             median= median(signal, na.rm= TRUE),
+             iqr= IQR( signal, na.rm= TRUE))
+#are the neuron activities standardized ?
+## No
+
+```
+The realtionship between mean and variance was also examined.
+
+```{r mean.var, cache= TRUE}
+ggplot( neuron.summary,
+  mapping = aes( mean, var, colour= worm)) +
+  geom_point()
+
+#could the high variance and high mean both be caused by outliers? Try the median and IQR which should be more robust
+#this suggests that neurons with high variance tend to have larger variance
+ggplot( neuron.summary,
+        mapping= aes( median, iqr, colour= worm)) +
+  geom_point()
+```
+
+Visualizing the time series
+```{r neuronDist, cache= TRUE}
+set.seed( 42) #for reprodusable "random" sampling
+neuron.to.plot <- paste0("Neuron.", sample.int( distinct.neurons[[1,"total.neurons"]], size= 4)) #randomly select a given number of neurons to plot
+#plot the traces of neuron activity for a single worm
+ggplot( neuro %>% filter( worm == "worm1", neuron %in% neuron.to.plot),
+        mapping= aes( x= Time.s., y= signal)) +
+  geom_line(mapping= aes(colour= behavior, group= 1)) +
+  facet_wrap( ~ neuron, ncol= 1)
+ggsave("worm1Traces.eps", width= 10* 1.6, height= 10)
+```
+
+## Model Validation
+
+Generalization error between on a testing dataset is one approach to validate a model.
+In partitioning the data, we wanted to maintain as much temporal structure as possible.
+Therefore, we split the data into segments each containing 9 timepoints and randomly assigned 20% of these values to the testing set.
+
+With this approach, we have test sets as small as 10 samples for some behaviors
+
+```{r trainingTest, echo=FALSE, cache= TRUE}
+#split the data into training and testing sets
+#numbr of consecutive obserations per bin
+segment.size <- 9
+neuro.grouped <- neuro %>%
+  # segments for each observed neuron are associated an index according to time
+  group_by( worm, neuron) %>%
+  mutate( segment=  (row_number( Time.s.) - 1) %/% segment.size ,
+          index= (row_number( Time.s.) - 1) %% segment.size) %>%
+  #segments not containing all forward movement are flagged as FALSE
+  group_by( segment) %>%
+  mutate( all.forward= cumall( as.character(behavior) == "forward"),
+          segment.time= Time.s. - first(Time.s.))
+
+
+#set the proportion of samples to be used in the training set
+train.proportion= 0.8
+all.inds <- neuro.grouped %>% 
+  #ensure that datasets contain multiple types of movement
+  group_by( worm, all.forward ) %>%
+  #get the indeces of each segment with 
+  do( inds= unique( .$segment)) 
+
+#make a reproducible partiton of training and test set
+set.seed( 42) 
+#specify training indeces rows are the same as for all.inds object
+train.inds <- all.inds %>%
+  do( train= sample( .$inds, size= floor( train.proportion * length(.$inds))))
+training <- bind_cols(all.inds, train.inds)
+
+#combine all training sets for each worm
+traininglist <- lapply( 0:3, function(ii) {
+  sort( union( training$train[[ 2*ii+1 ]], training$train[[2*ii + 2]] ))
+})
+#add names for each element of the list
+names( traininglist) <- paste0("worm", 1:4)
+
+neuro.grouped <- neuro.grouped %>%
+  mutate( train =  segment %in% unlist( traininglist[as.character(worm)]))
+train <- neuro.grouped %>%
+  filter( train== TRUE)
+rm( training, traininglist)
+
+#visualize the split of data for worm1
+ggplot( neuro.grouped %>% filter( as.character(worm) == "worm1", neuron == "Neuron.1"), mappin= aes( x= Time.s., y= as.numeric(train), colour= behavior)) +
+  geom_point() +
+  labs( title= "Split of observations among training and test set over time")
+
+#How many of each type of behavior are in the training and test sets?
+neuro.grouped %>%
+  filter( neuron == "Neuron.1", train == FALSE) %>%
+  group_by( worm) %>%
+    summarize( timepoints= n(),
+             percentage.forward= 100* sum( behavior %in% c( "forward")/ timepoints) ,
+             percentage.turn= 100* sum( behavior %in% c( "turn")/ timepoints) ,
+             percentage.pause= 100* sum( behavior %in% c( "pause")/ timepoints),
+             percentage.reverse= 100* sum( behavior %in% c( "reverse")) / timepoints)
+  
+```
+
+If some neurons have substantially different distributions of activity under different states, then it should be possible to train a hidden markov model to destinguish the states and to account for the overall probabilities of transitions between states
+
+```{r violin, fig.width=6, fig.height=40, cache= TRUE}
+#generate a split violin plot for each neuron using the approach from
+# http://stackoverflow.com/questions/35717353/split-violin-plot-with-ggplot2
+pdat <- neuro %>% filter( worm == "worm1") %>%
+  group_by( behavior, neuron) %>%
+  do( data.frame( loc= density(.$signal, na.rm= TRUE)$x,
+                  dens= density(.$signal, na.rm= TRUE)$y)) 
+
+# flip offset density for forward behavior
+pdat$dens <- ifelse( pdat$behavior == "forward", pdat$dens * -1, pdat$dens)
+pdat <- pdat %>%
+  #create numeric indeces for each neuron
+  mutate( neuron.number = as.numeric( gsub( pattern= "[^0-9]", replacement="", x= as.character(neuron))),
+          #shift each neuron according to its number
+          dens.shift= dens + 7*(neuron.number - 1))
+
+ggplot( pdat, mapping= aes( x= loc, y= dens.shift, fill= behavior, group= interaction( behavior, neuron))) +
+  geom_polygon(alpha=0.8) +
+  scale_y_continuous(breaks = seq(0,7*(max(pdat$neuron.number)-1), by=7), labels= as.character(1:max(pdat$neuron.number))) +
+labs( x= "signal", y="Neuron ID", title= "Behaviors are associated with different neuron activity distributions")
+```
+
+<!-- ## Logistic Regression -->
+
+<!-- The marginal distributions of activity for each neuron look roughly linear for each neuron. -->
+<!-- What is the correlation structure? -->
+
+<!-- ```{r Logistic Model} -->
+<!-- #consider a model for worm 1 only -->
+<!-- #based on example at http://www.ats.ucla.edu/stat/r/dae/mlogit.htm -->
+<!-- logistic.frame <- neuro.grouped %>% -->
+<!--   filter( worm == "worm1", train == TRUE) %>% -->
+<!--   spread( neuron, signal) %>% -->
+<!--   as.data.frame() -->
+<!-- #drop the missing "pause" behavior factor level -->
+<!-- logistic.frame$behavior <- factor( logistic.frame$behavior) -->
+<!-- #get response variables -->
+<!-- rel.behavior <-relevel( logistic.frame$behavior, ref= "forward") -->
+<!-- # use neurons as predictors -->
+<!-- neuron.names <- filter(all.neurons,  worm == "worm1")$neuron -->
+<!-- logistic.frame.clean <- cbind( rel.behavior, logistic.frame[ ,neuron.names]) -->
+<!-- #drop rows with missing values -->
+<!-- logistic.frame.clean <- logistic.frame.clean[ !is.na( rowSums( logistic.frame.clean[ , -1])) , ] -->
+<!-- #downsample to deal with class imbalances -->
+<!-- down_train <- downSample(x = logistic.frame.clean[,-1], -->
+<!--                          y = logistic.frame.clean$rel.behavior) -->
+
+<!-- #this section based on http://topepo.github.io/caret/training.html -->
+<!-- fitControl <- trainControl(## 10-fold CV -->
+<!--                            method = "repeatedcv", -->
+<!--                            number = 10, -->
+<!--                            ## repeated ten times -->
+<!--                            repeats = 10) -->
+<!-- multinomFit1 <- train( Class ~ ., data= down_train, -->
+<!--                        method= "multinom") -->
+<!-- plot.train( multinomFit1) -->
+<!-- summary( multinomFit1) -->
+<!-- densityplot( multinomFit1) -->
+<!-- ``` -->
+
+## Hidden Markov Model
+
+A generative model that can potentially be simple to estimate is the hidden markov model.
+Let the activity of each neuron be multivariate normal and let the staes of the model be forward, backward, turn, and pause. Following the approach of MLAPP, the transition matrix and multinomial distribution of initial states can be estimated using the observed proportions in the dataset.
+The sampling distribution of the mean will be 
+The sampling distribution of the covariance matrix will have a Wischart distribution.
+Covariance matrices are highly sensitive to outliers, so identifying and removing outliers may be an important part of the estimation process.
+
+One question that seems reasonable to ask is whether including the full covariance matrix in estimation improves upon the assumption of independance between the neurons.
+This is equivalent to testing a model with an unconstrained covariance matrix against a model with a diagonal covariance matrix.
+
+```{r gausianHMM, fig.width=8, fig.height=8, cache= TRUE}
+
+#' Title
+#'
+#' @param Y Observed states
+#' @param X Observed covariates ()
+#' @param groupOrder 
+#'
+#' @return
+#' @export
+#'
+#' @examples
+train.hmm.fullCov <- function(Y, X, groupOrder){
+  #remove any non-observed states from the factor datatype
+  states <- unique( as.factor( Y))
+  
+  #get the mean and covariance matrix for each HMM state
+  theta <- lapply( states, function( myState){
+    #use only values associated with myState
+    X.myState <- X[ Y == myState, ]
+    myMean <- colSums( X.myState, na.rm = TRUE)
+    myCov <- cov( X.myState, use= "pairwise.complete.obs")
+    list( mean= myMean, cov= myCov)
+  })
+  names( theta) <- as.character( states)
+  
+  #get the overal proportion of each state
+  #this is used for starting probabilities
+  piZero <- table( Y) / length( Y)
+  
+  #get the number of transitions between states
+  #initalize an empty transition matrix with rows and cols corresponding to states
+  A <- matrix(data= c(0), nrow= length( states), ncol= length( states),
+              dimnames= list( from= as.character( states), to= as.character( states)))
+  #iterate over a vector of all but the last observation
+  iis <- length( Y) - 1
+  for( ii in  1:iis){
+    #if Y[ii] and Y[ii + 1] are in the same group
+    #otherwise they are in different groups, so this pair doesn't inform the transition matrix
+    if( groupOrder[ ii + 1] > groupOrder[ ii]){
+      fromInd <- which( states == as.character( Y[ii]))
+      toInd <- which( states == as.character( Y[ii + 1]))
+      A[ fromInd, toInd] <- A[ fromInd, toInd] + 1
+    }
+  }
+  A <- A / rowSums(A)
+  
+  #return a list representation of the HMM
+  list( A= A, piZero= piZero, theta= theta)
+}
+
+
+#code for testing viterbi.hmm.gausian
+X <- filter( worm1.wide, segment == 3) %>% ungroup() %>% select( num_range( "Neuron.", 1:distinct.neuron.vec[ myWorm])) %>% as_data_frame()
+filter( worm1.wide, segment == 3)
+model <-worm1.hmm.fullCov
+
+viterbi.hmm.gausian <- function( X, model){
+  states <- names(model[["theta"]])
+
+  #initalize a matrix to store probabilities from the forward pass
+  deltas <- matrix( 0, nrow= length( model[["theta"]]), ncol= dim(X)[1])
+  #initalize a matrix of most probable previous states from the forward pass
+  as <- deltas
+  
+  # calculate using log emission probabilities from the log canonical parameterization for the MVG
+  lambdas <- lapply( states, function(myState) solve( model[["theta"]][[myState]][["cov"]]) )
+  names( lambdas) <- states
+  etas <- lapply( states, function( myState) lambdas[[myState]] %*% model[["theta"]][[myState]][["mean"]])
+  names( etas) <- states
+ 
+  #calculate probabilities for the first state
+   deltas[ ,1] <- sapply( states, function( myState) {
+    lpGaussianEmission( t( X[1,]), lambdas[[myState]], etas[[myState]])
+  })
+   
+  #calculate log transition probabilities
+  logA <- log( model[["A"]])
+  
+  for( ii in 2:dim(X)[1]){
+    #calculate emission log emission probabilities
+    emit <- sapply( states, function(myState) lpGaussianEmission( t( X[ii, ]), lambdas[[myState]], etas[[myState]]))
+    #represent joint density of current (cols) and previous (rows) state for emission
+    # Note constant col <=> indpendent of previous state
+    jointeimit <- matrix( rep( emit, times= length( states)), nrow= length( states), byrow= TRUE)
+    
+    #represent previous probabilities in joint format (constant rows <=> no dependence on current state)
+    jointdelta <- matrix( rep(deltas[ ,ii-1], times= length(states)), nrow= length( states))
+    
+    fulldelta <- jointdelta + logA + jointeimit
+    
+    #increment each path of most likely states
+    as[ ,ii] <- apply( X= fulldelta, MARGIN = 2, which.max)
+    
+    #increment total likelihood of each serise of states
+    deltas[ ,ii] <- fulldelta[ cbind( as[,ii], 1:length( states))]
+  }
+  
+  #initalize the most likely vector of states
+  xstar <- rep(0, times= dim(X)[1])
+  # most likely endpoint
+  xstar[ length( xstar)] <- which.max( deltas[ , length( xstar)])
+  #do "traceback to find most likely path"
+  for( ii in ( length( xstar)):2){
+    xstar[ ii -1] <- as[ xstar[ii], ii]
+  }
+}
+
+x <- t( X[1,])
+lambda <- lambdas[["forward"]]
+eta <-  etas[["forward"]]
+#proportional to the gausian emission liklihood
+lpGaussianEmission <- function( x, lambda, eta){
+  t(eta) %*% x - 0.5* t(x) %*% lambda %*% x
+}
+#Change data to wide format
+train.wide <- train %>% group_by( segment, worm) %>%
+  spread( neuron, signal)
+
+#split the data for worm1 into X Y format
+#TODO: fix this... correlations for pausing behavior shouldn't be present for worm1
+
+worm1.wide <- train.wide %>% filter( worm == "worm1")
+Y <- worm1.wide$behavior
+groupOrder <- worm1.wide$index
+myWorm <- "worm1"
+X <- worm1.wide %>% 
+  as.data.frame() %>%
+  select( num_range( "Neuron.", 1:distinct.neuron.vec[ myWorm]))
+#train the HMM
+worm1.hmm.fullCov <- train.hmm.fullCov( Y, X, groupOrder)
+
+#extract fitted variables to visualize them
+thetas <- worm1.hmm.fullCov[["theta"]]
+
+#
+hist( thetas[["reverse"]][["cov"]])
+#color scale
+pie(rep(1, 12), col = terrain.colors(12))
+#reverse
+heatmap(  1-cov2cor( thetas[["reverse"]][["cov"]]), symm= TRUE, col = terrain.colors(16))
+#turn
+heatmap(  1-cov2cor( thetas[["turn"]][["cov"]]), symm= TRUE, col = terrain.colors(16))
+#forward
+heatmap(  1-cov2cor( thetas[["forward"]][["cov"]]), symm= TRUE, col = terrain.colors(16))
+#pause
+#XXX this shouldn't be the case if worm1 doesn't ever pause
+#heatmap(  1-cov2cor( worm.covs[[1]][[4]]), symm= TRUE, col = terrain.colors(16))
+```
+  
+## Conditional Random Field
+* Conditional Random Fields
+  + Attributes: Descriminative

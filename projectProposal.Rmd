@@ -190,7 +190,7 @@ all.inds <- neuro.grouped %>%
   do( inds= unique( .$segment)) 
 
 #make a reproducible partiton of training and test set
-set.seed( 42) 
+set.seed( 123) 
 #specify training indeces rows are the same as for all.inds object
 train.inds <- all.inds %>%
   do( train= sample( .$inds, size= floor( train.proportion * length(.$inds))))
@@ -207,6 +207,8 @@ neuro.grouped <- neuro.grouped %>%
   mutate( train =  segment %in% unlist( traininglist[as.character(worm)]))
 train <- neuro.grouped %>%
   filter( train== TRUE)
+test <- neuro.grouped %>%
+  filter( train == FALSE)
 rm( training, traininglist)
 
 #visualize the split of data for worm1
@@ -294,7 +296,7 @@ An easy to estimate generative model is the hidden markov model.
 Let the activity of each neuron be multivariate normal and let the staes of the model be forward, backward, turn, and pause. Following the approach of MLAPP, the transition matrix and multinomial distribution of initial states can be estimated using the observed proportions in the dataset.
 The sampling distribution of the mean will be XXXX.
 The sampling distribution of the covariance matrix will have a Wischart distribution.
-Covariance matrices are highly sensitive to outliers, so identifying and removing outliers may be an important part of the estimation process.
+Covariance matrices are highly sensitive to outliers, so identifying and removing outliers may be an important part of the estimation process. One robust approach is to do a weighted estimate of the covariance matrix using the funciton, cov.rob from the MASS package.
 
 One question that seems reasonable to ask is whether including the full covariance matrix in estimation improves upon the assumption of independance between the neurons.
 This is equivalent to testing a model with an unconstrained covariance matrix against a model with a diagonal covariance matrix.
@@ -474,18 +476,44 @@ heatmap(  1-cov2cor( thetas[["forward"]][["cov"]]), symm= TRUE, col = terrain.co
 If the neurons can be assumed to be independent, a kernel density estimate can be used to provide an estimate of the emision probabilities that does not depend on the assumption of independence.
 
 ```{r kdeGMM}
-gmmKde <- function( Y, X, groupOrder){
+#test hmmKde
+#there is an issue with NA values being predicted for neuron1 under reverse behavior
+#true max activity of neuron1 under reverse behavior
+cbind(
+  trainMax= apply( X= X.train, MARGIN=2 , FUN= max),
+  testMax= apply( X= X.test, MARGIN=2 , FUN= max),
+  gridMax= max( model$theta$reverse$Neuron.1$x),
+  trainMin= apply( X= X.train, MARGIN=2 , FUN= min),
+  testMin= apply( X= X.test, MARGIN=2 , FUN= min),
+  gridMin= min( model$theta$reverse$Neuron.1$x))
+#this suggests that the binned KDE is not fully spanning the observed values
+
+look <- approxfun( )
+myState <- "reverse"
+myNeuron <- "Neuron.17"
+X <- X.test
+model <- model.hmmKde
+
+X<- X.train
+Y <- Y.train
+
+hmmKde <- function( Y, X, groupOrder){
   #remove any non-observed states from the factor datatype
   states <- unique( as.factor( Y))
   
+  #compute the probablity distribution for each neuron allong a grid of activity values
   theta <- lapply( states, function( myState){
-    #compute bandwith estimates for KDE
-    bandwidths <- apply( X= X, MARGIN= 2, FUN= dpik)
-    
-    #store previous observations as parameters of the model
-    list( observations= X[ Y == myState, ],
-          bandwidths= bandwidths)
+    #compute KDE using only a the observations corresponding to "myState"
+    grids <- apply( X= X[ as.character( Y) == myState, ], MARGIN= 2, FUN= function( myNeuron){
+      #compute bandwith estimates for KDE
+      bw <- dpik( myNeuron)
+      #support.max <- max( myNeuron) + 2*bw
+      #support.min <- min( myNeuron) - 2*bw
+      # range.x = c(support.min, support.max),
+      #return kernel density estimate
+      bkde( x= myNeuron, bandwidth= bw, gridsize= 601L)
     })
+  })
   names( theta) <- as.character( states)
   
   #get the overal proportion of each state
@@ -499,8 +527,91 @@ gmmKde <- function( Y, X, groupOrder){
   list( A= A, piZero= piZero, theta= theta)
 }
 
-gmmKde.predict <- function( X,groupOrder){
-  #TODO: use veterbi algorithm to make predictions from kernel density estimates
+#TODO add error handling to prevent out of bounds subscripting
+viterbi.hmmKde <- function( X, model){
+  #get information about names used to index the models
+  states <- names(model[["theta"]])
+  neurons <- names(model[["theta"]][[1]])
+  
+  #represent densities using linear interpolation
+  densities <- lapply( X= states, FUN= function( myState){
+    stateDensites <- lapply( X= neurons, FUN= function(myNeuron){
+      approxfun(x= model$theta[[myState]][[myNeuron]]$x,
+                y= model$theta[[myState]][[myNeuron]]$y,
+                # use extreme endpoints (generally very small values)
+                #as an overestimate of the probability of outliers
+                rule= 2)
+    })
+    names( stateDensites) <- neurons
+    stateDensites
+  })
+  names( densities) <- states
+  
+  #initalize a matrix to store probabilities from the forward pass
+  deltas <- matrix( 0, nrow= length( model[["theta"]]), ncol= dim(X)[1])
+  #initalize a matrix of most probable previous states from the forward pass
+  as <- deltas
+ 
+  #calculate probabilities for the first state
+  deltas[ ,1] <- sapply( states, function( myState) {
+    #assumption of independence between neurons means that log liklihood is a sum
+    Reduce( "+", 
+            sapply( neurons, function(myNeuron){
+      activity <- X[1, myNeuron]
+      #take abs of probability. to avoid with numerical problems from very small numbers
+      log( abs( densities[[myState]][[myNeuron]]( activity)))
+    })
+    )
+  })
+   
+  #calculate log transition probabilities
+  logA <- log( model[["A"]])
+  
+  #perform algorithm only if the vector is of length longer than 1
+  if( dim(X)[1] > 1)
+    for( ii in 2:dim(X)[1]){
+      #calculate emission log emission probabilities
+      emit <- sapply( states, function(myState){
+        Reduce( "+", 
+                sapply( neurons, function(myNeuron){
+                  activity <- X[ ii, myNeuron]
+                  #take log of probability. making sure the value is non-negative
+                  log( abs( densities[[myState]][[myNeuron]]( activity)))
+                })
+        )
+      })
+      #TODO: shouldn't have to deal with NA values for a point that was observed in the training set. Debug this...
+      emit[ which( is.na( emit))] <- -Inf
+      deltas[ which( is.na( deltas))] <- -Inf
+      
+      #represent joint density of current (cols) and previous (rows) state for emission
+      # Note constant col <=> indpendent of previous state
+      jointeimit <- matrix( rep( emit, times= length( states)), nrow= length( states), byrow= TRUE)
+      
+      #represent previous probabilities in joint format (constant rows <=> no dependence on current state)
+      jointdelta <- matrix( rep(deltas[ ,ii-1], times= length(states)), nrow= length( states))
+      
+      fulldelta <- jointdelta + logA + jointeimit
+      
+      #increment each path of most likely states
+      as[ ,ii] <- apply( X= fulldelta, MARGIN = 2, which.max)
+      
+      #increment total likelihood of each serise of states
+      deltas[ ,ii] <- fulldelta[ cbind( as[,ii], 1:length( states))]
+    }
+  
+  #initalize the most likely vector of states
+  xstar <- rep(0, times= dim(X)[1])
+  # most likely endpoint
+  xstar[ length( xstar)] <- which.max( deltas[ , length( xstar)])
+  #if there is more than one observation, do "traceback to find most likely path"
+  if( dim(X)[1] > 1)
+    for( ii in ( length( xstar)):2){
+      xstar[ ii -1] <- as[ xstar[ii], ii]
+    }
+  
+  # return states using the labels from model
+  states[xstar]
 }
 
 #for testing gmmKde
@@ -512,15 +623,48 @@ X <- worm1.wide %>%
   select( num_range( "Neuron.", 1:distinct.neuron.vec[ myWorm]))
 #find observations without any missing values
 non.nan <- which( !is.na(rowSums( X)))
-X <- X[ non.nan, ]
-Y <- worm1.wide$behavior[ non.nan]
+X.train <- X[ non.nan, ]
+Y.train <- worm1.wide$behavior[ non.nan]
 groupOrder <- worm1.wide$index[ non.nan]
+groupFold <- worm1.wide$segment[ non.nan]
+model.hmmKde <- hmmKde( Y.train, X.train, groupOrder)
+
+#testing viterbi.hmm.gausian using 9 consecutive observations
+X.test <- filter( worm1.wide, segment == 3) %>%
+  ungroup() %>%
+  select( num_range( "Neuron.", 1:distinct.neuron.vec[ myWorm])) %>%
+  as_data_frame()
+#calculate most probable sequence of states and compare to true values
+data.frame( predicted= viterbi.hmmKde(  X.test, model.hmmKde),
+            true= filter( worm1.wide, segment == 3) %>% ungroup() %>% select( true= behavior))
 ```
 
 ```{r crossValidation}
+#test the function
+X <- X.train
+Y <- Y.train
+groupOrder
+folds <- groupFold
+fit <- hmmKde
+predict <-viterbi.hmmKde
+lo <- 0
 
-foldCV <- function( training, test)
-#partition the training data into training and hold out sets
+looCV <- function( X, Y, groupOrder, folds, fit, predict){
+  lapply( X= unique( folds), FUN= function(lo){
+    trainInds <- folds != lo
+    testInds <- folds == lo
+    myFit <- fit( Y[ trainInds], X[ trainInds, ], groupOrder)
+    if( lo %% 10 == 0)
+      cat("iteration = ", lo, "\n")
+    predict( X[ testInds, ], myFit)
+  })
+}
+
+
+looKde <- looCV( X= X.train, Y= Y.train, groupOrder, folds= groupFold, fit= hmmKde, predict= viterbi.hmmKde)
+looKde.factor <- factor( unlist(looKde), levels= levels( Y.train))
+confusionMatrix( table(predicted= looKde.factor, true= Y.train))
+
 
 ```
 
@@ -540,4 +684,6 @@ After fitting several models, comparisons should be made using methods for evalu
 
 ## Conditional Random Field
 * Conditional Random Fields
-  + Attributes: Descriminative
+    + Attributes: Descriminative
+* Could use the squared Exponential ARD Kernel 
+    + ( Summary of Kernel functions)[http://people.seas.harvard.edu/~dduvenaud/cookbook/]
